@@ -338,6 +338,7 @@ export default function TerminalChat({
           <ModelOverlay
             currentModel={model}
             hasLastResponse={Boolean(lastResponseId)}
+            useOpenRouter={Boolean(config.useOpenRouter)}
             onSelect={(newModel) => {
               if (isLoggingEnabled()) {
                 log(

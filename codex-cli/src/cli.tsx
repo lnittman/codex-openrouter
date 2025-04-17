@@ -63,6 +63,7 @@ const cli = meow(
 
     --auto-edit                Automatically approve file edits; still prompt for commands
     --full-auto                Automatically approve edits and commands when executed in the sandbox
+    --use-openrouter           Use OpenRouter API instead of OpenAI API (requires OPENROUTER_API_KEY)
 
     --no-project-doc           Do not automatically include the repository's 'codex.md'
     --project-doc <file>       Include an additional markdown file at <file> as context
@@ -82,6 +83,7 @@ const cli = meow(
     $ codex "Write and run a python program that prints ASCII art"
     $ codex -q "fix build issues"
     $ codex completion bash
+    $ codex --use-openrouter -m anthropic/claude-3-opus-20240229 "Analyze this codebase"
 `,
   {
     importMeta: import.meta,
@@ -145,6 +147,10 @@ const cli = meow(
         description: `Run in full-context editing approach. The model is given the whole code
           directory as context and performs changes in one go without acting.`,
       },
+      useOpenRouter: {
+        type: "boolean",
+        description: "Use OpenRouter API instead of OpenAI API (requires OPENROUTER_API_KEY env var)",
+      },
     },
   },
 );
@@ -204,9 +210,27 @@ if (cli.flags.config) {
 // API key handling
 // ---------------------------------------------------------------------------
 
+// Debug flag state
+console.log("CLI Flags:", JSON.stringify(cli.flags, null, 2));
+// Meow converts camelCase to lowercase in flags, so we need to check for 'useOpenrouter'
+const useOpenRouter = Boolean(cli.flags.useOpenrouter); // lowercase 'r' as processed by meow
+console.log("useOpenRouter flag value:", useOpenRouter);
 const apiKey = process.env["OPENAI_API_KEY"];
+const openRouterKey = process.env["OPENROUTER_API_KEY"];
+console.log("OpenRouter key exists:", !!openRouterKey);
 
-if (!apiKey) {
+if (useOpenRouter && !openRouterKey) {
+  // eslint-disable-next-line no-console
+  console.error(
+    `\n${chalk.red("Missing OpenRouter API key.")}\n\n` +
+      `Set the environment variable ${chalk.bold("OPENROUTER_API_KEY")} ` +
+      `and re-run this command.\n` +
+      `You can create a key here: ${chalk.bold(
+        chalk.underline("https://openrouter.ai/keys"),
+      )}\n`,
+  );
+  process.exit(1);
+} else if (!useOpenRouter && !apiKey) {
   // eslint-disable-next-line no-console
   console.error(
     `\n${chalk.red("Missing OpenAI API key.")}\n\n` +
@@ -228,22 +252,55 @@ let config = loadConfig(undefined, undefined, {
 });
 
 const prompt = cli.input[0];
-const model = cli.flags.model;
+let model = cli.flags.model;
 const imagePaths = cli.flags.image as Array<string> | undefined;
+
+// Helper function to add OpenAI prefix to common models
+const addOpenAIPrefix = (modelName: string | undefined): string | undefined => {
+  if (!modelName || modelName.includes('/')) return modelName;
+  
+  const commonOpenAIModels = ['o4-mini', 'o4', 'o3', 'o3-mini', 'gpt-4', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o'];
+  if (commonOpenAIModels.some(m => modelName.startsWith(m))) {
+    const prefixedModel = `openai/${modelName}`;
+    console.log(`Added 'openai/' prefix to model: ${prefixedModel}`);
+    return prefixedModel;
+  }
+  return modelName;
+};
+
+// If using OpenRouter and model is specified but doesn't have a provider prefix,
+// add the 'openai/' prefix to common OpenAI models
+if (useOpenRouter && model) {
+  model = addOpenAIPrefix(model);
+}
+
+// Also ensure the config model has a prefix if needed
+if (useOpenRouter && config.model) {
+  config.model = addOpenAIPrefix(config.model);
+}
 
 config = {
   apiKey,
   ...config,
   model: model ?? config.model,
+  useOpenRouter,
+  openRouterApiKey: openRouterKey, // Pass the key explicitly
 };
+console.log("Config object:", {
+  model: config.model,
+  useOpenRouter,
+  hasOpenRouterKey: !!openRouterKey
+});
 
-if (!(await isModelSupportedForResponses(config.model))) {
+if (!(await isModelSupportedForResponses(config.model, useOpenRouter))) {
   // eslint-disable-next-line no-console
   console.error(
     `The model "${config.model}" does not appear in the list of models ` +
-      `available to your account. Double‑check the spelling (use\n` +
-      `  openai models list\n` +
-      `to see the full list) or choose another model with the --model flag.`,
+      `available to your account. Double‑check the spelling ` +
+      (useOpenRouter 
+        ? `or choose another model with the --model flag.`
+        : `(use\n  openai models list\n` +
+          `to see the full list) or choose another model with the --model flag.`),
   );
   process.exit(1);
 }
@@ -323,7 +380,7 @@ const approvalPolicy: ApprovalPolicy =
     ? AutoApprovalMode.AUTO_EDIT
     : AutoApprovalMode.SUGGEST;
 
-preloadModels();
+preloadModels(useOpenRouter);
 
 const instance = render(
   <App

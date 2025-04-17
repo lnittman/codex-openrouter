@@ -1,6 +1,7 @@
 import TypeaheadOverlay from "./typeahead-overlay.js";
 import {
   getAvailableModels,
+  getAvailableOpenRouterModels,
   RECOMMENDED_MODELS,
 } from "../utils/model-utils.js";
 import { Box, Text, useInput } from "ink";
@@ -19,6 +20,7 @@ type Props = {
   hasLastResponse: boolean;
   onSelect: (model: string) => void;
   onExit: () => void;
+  useOpenRouter?: boolean;
 };
 
 export default function ModelOverlay({
@@ -26,6 +28,7 @@ export default function ModelOverlay({
   hasLastResponse,
   onSelect,
   onExit,
+  useOpenRouter = false,
 }: Props): JSX.Element {
   const [items, setItems] = useState<Array<{ label: string; value: string }>>(
     [],
@@ -33,9 +36,13 @@ export default function ModelOverlay({
 
   useEffect(() => {
     (async () => {
-      const models = await getAvailableModels();
+      console.log("[ModelOverlay] Fetching models with useOpenRouter:", useOpenRouter);
+      const models = useOpenRouter 
+        ? await getAvailableOpenRouterModels()
+        : await getAvailableModels();
+      console.log("[ModelOverlay] Retrieved models:", models?.length || 0);
 
-      // Split the list into recommended and “other” models.
+      // Split the list into recommended and "other" models.
       const recommended = RECOMMENDED_MODELS.filter((m) => models.includes(m));
       const others = models.filter((m) => !recommended.includes(m));
 
@@ -48,7 +55,7 @@ export default function ModelOverlay({
         })),
       );
     })();
-  }, []);
+  }, [useOpenRouter]);
 
   // ---------------------------------------------------------------------------
   // If the conversation already contains a response we cannot change the model

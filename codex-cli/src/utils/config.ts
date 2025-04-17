@@ -17,6 +17,8 @@ import { dirname, join, extname, resolve as resolvePath } from "path";
 
 export const DEFAULT_AGENTIC_MODEL = "o4-mini";
 export const DEFAULT_FULL_CONTEXT_MODEL = "gpt-4.1";
+export const DEFAULT_OPENROUTER_AGENTIC_MODEL = "openai/o4-mini";
+export const DEFAULT_OPENROUTER_FULL_CONTEXT_MODEL = "openai/gpt-4.1";
 export const DEFAULT_APPROVAL_MODE = AutoApprovalMode.SUGGEST;
 export const DEFAULT_INSTRUCTIONS = "";
 
@@ -34,10 +36,16 @@ export const INSTRUCTIONS_FILEPATH = join(CONFIG_DIR, "instructions.md");
 export const OPENAI_TIMEOUT_MS =
   parseInt(process.env["OPENAI_TIMEOUT_MS"] || "0", 10) || undefined;
 export const OPENAI_BASE_URL = process.env["OPENAI_BASE_URL"] || "";
+export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 export let OPENAI_API_KEY = process.env["OPENAI_API_KEY"] || "";
+export let OPENROUTER_API_KEY = process.env["OPENROUTER_API_KEY"] || "";
 
 export function setApiKey(apiKey: string): void {
   OPENAI_API_KEY = apiKey;
+}
+
+export function setOpenRouterApiKey(apiKey: string): void {
+  OPENROUTER_API_KEY = apiKey;
 }
 
 // Formatting (quiet mode-only).
@@ -49,6 +57,7 @@ export type StoredConfig = {
   approvalMode?: AutoApprovalMode;
   fullAutoErrorMode?: FullAutoErrorMode;
   memory?: MemoryConfig;
+  useOpenRouter?: boolean;
 };
 
 // Minimal config written on first run.  An *empty* model string ensures that
@@ -70,6 +79,8 @@ export type AppConfig = {
   instructions: string;
   fullAutoErrorMode?: FullAutoErrorMode;
   memory?: MemoryConfig;
+  useOpenRouter?: boolean;
+  openRouterApiKey?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -246,13 +257,22 @@ export const loadConfig = (
       ? storedConfig.model.trim()
       : undefined;
 
+  // Determine if we should use OpenRouter
+  const useOpenRouter = storedConfig.useOpenRouter ?? false;
+
   const config: AppConfig = {
     model:
       storedModel ??
-      (options.isFullContext
-        ? DEFAULT_FULL_CONTEXT_MODEL
-        : DEFAULT_AGENTIC_MODEL),
+      (useOpenRouter
+        ? (options.isFullContext
+            ? DEFAULT_OPENROUTER_FULL_CONTEXT_MODEL
+            : DEFAULT_OPENROUTER_AGENTIC_MODEL)
+        : (options.isFullContext
+            ? DEFAULT_FULL_CONTEXT_MODEL
+            : DEFAULT_AGENTIC_MODEL)),
     instructions: combinedInstructions,
+    useOpenRouter,
+    openRouterApiKey: OPENROUTER_API_KEY,
   };
 
   // -----------------------------------------------------------------------
@@ -340,13 +360,22 @@ export const saveConfig = (
     mkdirSync(dir, { recursive: true });
   }
 
+  const configToSave = {
+    model: config.model,
+  };
+  
+  // Only include useOpenRouter in the config if it's explicitly set to true
+  if (config.useOpenRouter) {
+    Object.assign(configToSave, { useOpenRouter: true });
+  }
+  
   const ext = extname(targetPath).toLowerCase();
   if (ext === ".yaml" || ext === ".yml") {
-    writeFileSync(targetPath, dumpYaml({ model: config.model }), "utf-8");
+    writeFileSync(targetPath, dumpYaml(configToSave), "utf-8");
   } else {
     writeFileSync(
       targetPath,
-      JSON.stringify({ model: config.model }, null, 2),
+      JSON.stringify(configToSave, null, 2),
       "utf-8",
     );
   }

@@ -9,7 +9,12 @@ import type {
 import type { Reasoning } from "openai/resources.mjs";
 
 import { log, isLoggingEnabled } from "./log.js";
-import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
+import { 
+  OPENAI_BASE_URL, 
+  OPENAI_TIMEOUT_MS, 
+  OPENROUTER_BASE_URL, 
+  OPENROUTER_API_KEY 
+} from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
 import {
   ORIGIN,
@@ -236,6 +241,20 @@ export class AgentLoop {
     // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
     const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
+    const openRouterKey = this.config.openRouterApiKey ?? OPENROUTER_API_KEY;
+    const useOpenRouter = this.config.useOpenRouter ?? false;
+    
+    // Debug OpenRouter configuration
+    console.log("[Agent] OpenRouter config:", {
+      useOpenRouter,
+      hasOpenRouterKey: !!openRouterKey,
+      baseURL: useOpenRouter && openRouterKey ? OPENROUTER_BASE_URL : OPENAI_BASE_URL,
+      config: {
+        useOpenRouter: this.config.useOpenRouter,
+        model: this.config.model
+      }
+    });
+    
     this.oai = new OpenAI({
       // The OpenAI JS SDK only requires `apiKey` when making requests against
       // the official API.  When running unit‑tests we stub out all network
@@ -243,12 +262,15 @@ export class AgentLoop {
       // the property if we actually have a value to avoid triggering runtime
       // errors inside the SDK (it validates that `apiKey` is a non‑empty
       // string when the field is present).
-      ...(apiKey ? { apiKey } : {}),
-      baseURL: OPENAI_BASE_URL,
+      ...(useOpenRouter && openRouterKey
+          ? { apiKey: openRouterKey }
+          : apiKey ? { apiKey } : {}),
+      baseURL: useOpenRouter && openRouterKey ? OPENROUTER_BASE_URL : OPENAI_BASE_URL,
       defaultHeaders: {
         originator: ORIGIN,
         version: CLI_VERSION,
         session_id: this.sessionId,
+        ...(useOpenRouter && openRouterKey ? { "HTTP-Referer": "https://github.com/openai/codex" } : {}),
       },
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
@@ -500,43 +522,226 @@ export class AgentLoop {
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
             }
-            // eslint-disable-next-line no-await-in-loop
-            stream = await this.oai.responses.create({
-              model: this.model,
-              instructions: mergedInstructions,
-              previous_response_id: lastResponseId || undefined,
-              input: turnInput,
-              stream: true,
-              parallel_tool_calls: false,
-              reasoning,
-              tools: [
-                {
-                  type: "function",
-                  name: "shell",
-                  description: "Runs a shell command, and returns its output.",
-                  strict: false,
-                  parameters: {
-                    type: "object",
-                    properties: {
-                      command: { type: "array", items: { type: "string" } },
-                      workdir: {
-                        type: "string",
-                        description: "The working directory for the command.",
+            // Logging removed for cleaner output
+            
+            try {
+              if (this.config.useOpenRouter) {
+                try {
+                  // For OpenRouter, try using the chat completions endpoint instead of responses endpoint
+                  // since it's more widely supported by different model providers
+                  
+                  // Convert turnInput to chat completions format
+                  const messages = [];
+                  
+                  // First add a system message with instructions
+                  messages.push({
+                    role: "system",
+                    content: mergedInstructions
+                  });
+                  
+                  // Then add user messages from turnInput
+                  for (const item of turnInput) {
+                    if (item.type === "message" && item.role === "user") {
+                      // Extract text content from the message
+                      let content = "";
+                      if (Array.isArray(item.content)) {
+                        content = item.content
+                          .filter(c => c.type === "input_text")
+                          .map(c => c.text)
+                          .join("\n");
+                      }
+                      messages.push({
+                        role: "user",
+                        content: content || "Help me with this codebase"
+                      });
+                    }
+                  }
+                  
+                  // eslint-disable-next-line no-await-in-loop
+                  const chatStream = await this.oai.chat.completions.create({
+                    model: this.model,
+                    messages: messages,
+                    stream: true,
+                    tools: [
+                      {
+                        type: "function",
+                        function: {
+                          name: "shell",
+                          description: "Runs a shell command, and returns its output.",
+                          parameters: {
+                            type: "object",
+                            properties: {
+                              command: { 
+                                type: "array", 
+                                items: { type: "string" } 
+                              },
+                              workdir: {
+                                type: "string",
+                                description: "The working directory for the command."
+                              },
+                              timeout: {
+                                type: "number",
+                                description: "The maximum time to wait for the command to complete in milliseconds."
+                              }
+                            },
+                            required: ["command"]
+                          }
+                        }
+                      }
+                    ],
+                    // OpenRouter specific fields
+                    http_referer: "https://github.com/openai/codex"
+                  });
+                  
+                  // Create a non-streaming approach for OpenRouter 
+                  // Instead of true streaming, we'll just collect all content and return a single response
+                  let allContent = "";
+                  
+                  // Collect the entire response from the stream first
+                  for await (const chunk of chatStream) {
+                    if (chunk.choices?.[0]?.delta?.content) {
+                      allContent += chunk.choices[0].delta.content;
+                    }
+                  }
+                  
+                  // Create a simple fake response object that returns the complete text at once
+                  const fakeResponse = {
+                    id: `openrouter-${Date.now()}`,
+                    status: "completed",
+                    output: [
+                      {
+                        id: `msg-${Date.now()}`,
+                        type: "message",
+                        role: "assistant",
+                        content: [
+                          {
+                            type: "output_text", 
+                            text: allContent
+                          }
+                        ]
+                      }
+                    ]
+                  };
+                  
+                  // Create a simple fake stream that emits just the complete response
+                  const fakeResponsesStream = {
+                    [Symbol.asyncIterator]: async function* () {
+                      // Only yield the completed response
+                      yield {
+                        type: "response.completed",
+                        response: fakeResponse
+                      };
+                    }
+                  };
+                  
+                  stream = fakeResponsesStream;
+                  // Stream wrapper created successfully
+                } catch (chatError) {
+                  console.error("[Agent] Failed to use chat completions, falling back to responses:", chatError);
+                  
+                  // Fall back to standard responses API (which might not work with all providers)
+                  stream = await this.oai.responses.create({
+                    model: this.model,
+                    instructions: mergedInstructions,
+                    previous_response_id: lastResponseId || undefined,
+                    input: turnInput,
+                    stream: true,
+                    parallel_tool_calls: false,
+                    reasoning,
+                    tools: [
+                      {
+                        type: "function",
+                        name: "shell",
+                        description: "Runs a shell command, and returns its output.",
+                        strict: false,
+                        parameters: {
+                          type: "object",
+                          properties: {
+                            command: { type: "array", items: { type: "string" } },
+                            workdir: {
+                              type: "string",
+                              description: "The working directory for the command.",
+                            },
+                            timeout: {
+                              type: "number",
+                              description:
+                                "The maximum time to wait for the command to complete in milliseconds.",
+                            },
+                          },
+                          required: ["command"],
+                          additionalProperties: false,
+                        },
                       },
-                      timeout: {
-                        type: "number",
-                        description:
-                          "The maximum time to wait for the command to complete in milliseconds.",
+                    ],
+                    // OpenRouter specific fields
+                    http_referer: "https://github.com/openai/codex",
+                    transform_json: true
+                  });
+                }
+              } else {
+                // For OpenAI, use the standard format
+                // eslint-disable-next-line no-await-in-loop
+                stream = await this.oai.responses.create({
+                  model: this.model,
+                  instructions: mergedInstructions,
+                  previous_response_id: lastResponseId || undefined,
+                  input: turnInput,
+                  stream: true,
+                  parallel_tool_calls: false,
+                  reasoning,
+                  tools: [
+                    {
+                      type: "function",
+                      name: "shell",
+                      description: "Runs a shell command, and returns its output.",
+                      strict: false,
+                      parameters: {
+                        type: "object",
+                        properties: {
+                          command: { type: "array", items: { type: "string" } },
+                          workdir: {
+                            type: "string",
+                            description: "The working directory for the command.",
+                          },
+                          timeout: {
+                            type: "number",
+                            description:
+                              "The maximum time to wait for the command to complete in milliseconds.",
+                          },
+                        },
+                        required: ["command"],
+                        additionalProperties: false,
                       },
                     },
-                    required: ["command"],
-                    additionalProperties: false,
-                  },
-                },
-              ],
-            });
+                  ],
+                });
+              }
+              console.log("[Agent] Successfully created stream");
+            } catch (error) {
+              console.error("[Agent] Error creating stream:", error);
+              // Re-throw the error to be handled by the caller
+              throw error;
+            }
             break;
           } catch (error) {
+            console.error("[Agent] Error in API request:", error);
+            
+            // Detailed error logging
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const errCtx = error as any;
+            console.error("[Agent] Error details:", {
+              message: errCtx?.message,
+              status: errCtx?.status,
+              httpStatus: errCtx?.httpStatus,
+              statusCode: errCtx?.statusCode,
+              code: errCtx?.code,
+              type: errCtx?.type,
+              param: errCtx?.param,
+              useOpenRouter: this.config.useOpenRouter,
+              model: this.model,
+              response: errCtx?.response?.data || errCtx?.response?.body || null
+            });
+            
             const isTimeout = error instanceof APIConnectionTimeoutError;
             // Lazily look up the APIConnectionError class at runtime to
             // accommodate the test environment's minimal OpenAI mocks which
@@ -550,7 +755,6 @@ export class AgentLoop {
               ? error instanceof ApiConnErrCtor
               : false;
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const errCtx = error as any;
             const status =
               errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
             const isServerError = typeof status === "number" && status >= 500;
@@ -559,7 +763,7 @@ export class AgentLoop {
               attempt < MAX_RETRIES
             ) {
               log(
-                `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
+                `${this.config.useOpenRouter ? "OpenRouter" : "OpenAI"} request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
               );
               continue;
             }
@@ -607,7 +811,7 @@ export class AgentLoop {
                   }
                 }
                 log(
-                  `OpenAI rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
+                  `${this.config.useOpenRouter ? "OpenRouter" : "OpenAI"} rate limit exceeded (attempt ${attempt}/${MAX_RETRIES}), retrying in ${Math.round(
                     delayMs,
                   )} ms...`,
                 );
@@ -633,7 +837,7 @@ export class AgentLoop {
                   content: [
                     {
                       type: "input_text",
-                      text: `⚠️  Rate limit reached. Error details: ${errorDetails}. Please try again later.`,
+                      text: `⚠️  Rate limit reached while contacting ${this.config.useOpenRouter ? "OpenRouter" : "OpenAI"}. Error details: ${errorDetails}. Please try again later.`,
                     },
                   ],
                 });
@@ -651,6 +855,30 @@ export class AgentLoop {
               errCtx.code === "invalid_request_error" ||
               errCtx.type === "invalid_request_error";
             if (isClientError) {
+              // Handle OpenRouter specific common errors
+              const isOpenRouterUnsupportedModel = 
+                this.config.useOpenRouter &&
+                (errCtx.message?.includes("does not exist") || 
+                 errCtx.message?.includes("not found") || 
+                 errCtx.message?.includes("Invalid model:"));
+                 
+              if (isOpenRouterUnsupportedModel) {
+                console.log("[Agent] OpenRouter unsupported model error detected:", this.model);
+                this.onItem({
+                  id: `error-${Date.now()}`,
+                  type: "message",
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `⚠️  OpenRouter could not find the model "${this.model}". This model may not be supported by OpenRouter. Try selecting a different model using the /model command, or verify that the model ID is correct.`,
+                    },
+                  ],
+                });
+                this.onLoading(false);
+                return;
+              }
+              
               this.onItem({
                 id: `error-${Date.now()}`,
                 type: "message",
@@ -674,15 +902,19 @@ export class AgentLoop {
                             requestId?: string;
                           }>
                         )?.requestId;
+                        
+                      // Get response data if available
+                      const responseData = errCtx.response?.data || errCtx.response?.body;
+                      const responseMessage = responseData?.error?.message || responseData?.message || '';
 
                       const errorDetails = [
                         `Status: ${status || "unknown"}`,
                         `Code: ${errCtx.code || "unknown"}`,
                         `Type: ${errCtx.type || "unknown"}`,
-                        `Message: ${errCtx.message || "unknown"}`,
+                        `Message: ${errCtx.message || responseMessage || "unknown"}`,
                       ].join(", ");
 
-                      return `⚠️  OpenAI rejected the request${
+                      return `⚠️  ${this.config.useOpenRouter ? "OpenRouter" : "OpenAI"} rejected the request${
                         reqId ? ` (request ID: ${reqId})` : ""
                       }. Error details: ${errorDetails}. Please verify your settings and try again.`;
                     })(),
@@ -728,8 +960,15 @@ export class AgentLoop {
             if (isLoggingEnabled()) {
               log(`AgentLoop.run(): response event ${event.type}`);
             }
+            
+            // For custom events from our OpenRouter wrapper
+            // Handle "message" event (custom OpenRouter adapter event)
+            if (event.type === "message") {
+              stageItem(event as ResponseItem);
+              continue; // Skip to next event
+            }
 
-            // process and surface each item (no‑op until we can depend on streaming events)
+            // Handle standard OpenAI response API events
             if (event.type === "response.output_item.done") {
               const item = event.item;
               // 1) if it's a reasoning item, annotate it
@@ -760,6 +999,7 @@ export class AgentLoop {
                   stageItem(item as ResponseItem);
                 }
               }
+              
               if (event.response.status === "completed") {
                 // TODO: remove this once we can depend on streaming events
                 const newTurnInput = await this.processEventsWithoutStreaming(
@@ -768,6 +1008,7 @@ export class AgentLoop {
                 );
                 turnInput = newTurnInput;
               }
+              
               lastResponseId = event.response.id;
               this.onLastResponseId(event.response.id);
             }
